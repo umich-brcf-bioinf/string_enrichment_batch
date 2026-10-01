@@ -1,10 +1,6 @@
 # STRING enrichment evaluation
 
-A parameterized R Markdown file submits ranked gene lists to the STRING
-functional enrichment API, polls until each job finishes, downloads the
-results, and builds a comparison report across contrasts.  It makes a 
-couple of visualizations for the contrasts-some are limited to just a 
-subset of contrasts which you can select.
+This submits ranked gene lists to the STRING functional enrichment API, polls until each job finishes, downloads the results, and builds a comparison report across contrasts.  It makes a  couple of visualizations for the contrasts-some are limited to just a subset of contrasts which you can select.
 
 ## Usage
 
@@ -15,9 +11,7 @@ singularity exec --bind /nfs:/nfs docker://umichbfxcore/proteomics_env:oculomics
 
 `run_string_enrichment.R` is a thin CLI wrapper: it parses `--key=value`
 arguments and calls `rmarkdown::render()` on `string_enrichment.Rmd` with
-them as knit params. All of the actual logic (API submission, polling,
-downloading, plotting) lives in the `.Rmd` itself — the wrapper exists only
-so you don't have to hand-edit an R script before every run.
+them as knit params. 
 
 ## Input format
 
@@ -28,8 +22,7 @@ so you don't have to hand-edit an R script before every run.
   a t-statistic from `limma::topTable`).
 * The filename (minus extension) becomes the contrast's label in the report.
 
-This is the same format the current pipeline already expects — e.g. what
-`AutoGenes_diffex_followup.Rmd` writes to `tables/string/input/` via:
+This can be written from limma results for example via:
 
 ```r
 topTable_result %>%
