@@ -1,0 +1,463 @@
+---
+title: "Summary of STRING enrichment results"
+author: "`r Sys.getenv('USER')`"
+date: "`r Sys.Date()`"
+output:
+        bookdown::html_document2:
+            theme: readable
+            toc: true
+            toc_float: true
+            number_sections: true
+            fig_caption: true
+            keep_md: false
+params:
+    input_loc: NA
+    output_loc: NA
+    species: 9606
+    fdr_threshold: 0.05
+    caller_identity: "ncarruth"
+    api_key: "bJu7N36Gn6FE"
+    poll_interval_sec: 30
+    poll_timeout_min: 60
+    force_refresh: FALSE
+    selected_contrasts: NA
+---
+
+*Contact:*
+
+* Nick Carruthers, <ncarruth@umich.edu>
+
+This report submits one or more ranked gene lists to the [STRING](https://string-db.org)
+functional enrichment API, waits for the jobs to finish, and summarizes the results
+across contrasts. It is entirely self-contained: point it at a folder of per-contrast
+input files and an output folder, and it handles submission, polling, downloading, and
+reporting in one render. The pairwise comparison figures are limited to up to 4
+contrasts, chosen via `selected_contrasts` (a comma-separated list of contrast names)
+and defaulting to the first 4 successfully-processed contrasts when unset.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries, include = FALSE}
+library(tidyverse)
+library(kableExtra)
+library(ggrepel)
+library(pheatmap)
+library(httr)
+library(jsonlite)
+library(qvalue)
+library(UpSetR)
+library(ggiraph)
+
+source(file.path(dirname(knitr::current_input(dir = TRUE)), "string_summarize_functions.R"))
+
+theme_set(theme_bw(base_size = 8))
+
+## From Color Universal Design (CUD): https://jfly.uni-koeln.de/color/
+okabe_ito <- c("#E69F00", "#56B4E9", "#009E73", "#0072B2", "#F0E442",
+  "#0072B2", "#D55E00", "#CC79A7", "#000000")
+```
+
+```{r validate-and-setup, include = FALSE}
+stopifnot(
+    "params$input_loc must be set" = !is.na(params$input_loc),
+    "params$output_loc must be set" = !is.na(params$output_loc)
+)
+stopifnot("input_loc does not exist" = dir.exists(params$input_loc))
+
+tables_dir <- file.path(params$output_loc, "tables")
+figures_dir <- file.path(params$output_loc, "figures")
+cache_dir <- file.path(params$output_loc, "cache")
+code_dir <- file.path(params$output_loc, "code")
+
+for (d in c(tables_dir, figures_dir, cache_dir, code_dir)) {
+    dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+## clear stale report artifacts on every render; cache/ is left alone so
+## completed STRING jobs are not resubmitted
+do.call(file.remove, list(list.files(tables_dir, full.names = TRUE)))
+do.call(file.remove, list(list.files(figures_dir, full.names = TRUE)))
+
+input_files <- sort(list.files(params$input_loc, full.names = TRUE))
+input_files <- input_files[!dir.exists(input_files)]
+stopifnot("input_loc contains no files" = length(input_files) > 0)
+
+contrast_names <- tools::file_path_sans_ext(basename(input_files))
+names(input_files) <- contrast_names
+
+cache_file <- file.path(cache_dir, "string_results.RDS")
+string_api_url <- "https://version-12-0.string-db.org/api"
+```
+
+```{r helper-functions, include = FALSE}
+## Submit one ranked gene list and return its STRING job id
+submit_contrast <- function(file_path) {
+    identifiers <- paste(readLines(file_path, warn = FALSE), collapse = "\n")
+
+    resp <- POST(
+        paste(string_api_url, "json", "valuesranks_enrichment_submit", sep = "/"),
+        body = list(
+            species = params$species,
+            caller_identity = params$caller_identity,
+            identifiers = identifiers,
+            api_key = params$api_key,
+            ge_fdr = params$fdr_threshold,
+            ge_enrichment_rank_direction = -1
+        ),
+        encode = "form"
+    )
+    stop_for_status(resp)
+    parsed <- content(resp, as = "parsed", type = "application/json")
+    parsed[[1]]$job_id
+}
+
+## Poll a STRING job until it succeeds, fails, or times out.
+## Returns a list with status ("success"/"failed"/"timeout") and, on
+## success, page_url/download_url.
+poll_job <- function(job_id) {
+    deadline <- Sys.time() + params$poll_timeout_min * 60
+    repeat {
+        resp <- GET(
+            paste(string_api_url, "json", "valuesranks_enrichment_status", sep = "/"),
+            query = list(api_key = params$api_key, job_id = job_id)
+        )
+        stop_for_status(resp)
+        ## the status endpoint, like submit, wraps its object in a JSON array
+        parsed <- content(resp, as = "parsed", type = "application/json")[[1]]
+
+        if (identical(parsed$status, "success")) {
+            return(list(status = "success", page_url = parsed$page_url, download_url = parsed$download_url))
+        }
+        if (identical(parsed$status, "failed")) {
+            return(list(status = "failed"))
+        }
+        if (Sys.time() >= deadline) {
+            return(list(status = "timeout"))
+        }
+        Sys.sleep(params$poll_interval_sec)
+    }
+}
+
+## Significant term IDs for one result table
+extract_significant_terms <- function(df, category, fdr_threshold = 0.05) {
+    df %>%
+        filter(category == !!category) %>%
+        filter(falseDiscoveryRate < fdr_threshold) %>%
+        pull(termID)
+}
+
+## Terms in one category passing the enrichment score & FDR thresholds, with a
+## signed -log10(FDR) column (positive = increased/"top", negative = decreased/"bottom")
+filter_significant_terms <- function(df, category, enrichment_score_threshold, fdr_threshold) {
+    df %>%
+        filter(category == !!category & enrichmentScore > enrichment_score_threshold & falseDiscoveryRate < fdr_threshold) %>%
+        mutate(signed_log_FDR = ifelse(direction == "bottom", log10(falseDiscoveryRate), -log10(falseDiscoveryRate)))
+}
+
+## Pairwise signed -log10(FDR) scatter of significant terms for one category,
+## across every pair of contrasts in str_res_list
+build_pairwise_scatter <- function(str_res_list, category, enrichment_score_threshold, fdr_threshold) {
+    df_list <- list()
+    my_count <- 1
+    n <- length(str_res_list)
+    if (n < 2) return(NULL)
+
+    for (i in seq(1, n - 1)) {
+        for (j in seq(i + 1, n)) {
+            ## full_join (rather than inner_join) keeps terms significant in only one
+            ## of the two contrasts; their missing signed_log_FDR on the other side is
+            ## set to 0 instead of being dropped from the plot.
+            x_frame <- filter_significant_terms(str_res_list[[i]], category, enrichment_score_threshold, fdr_threshold) %>%
+                select(termID, termDescription, signed_log_FDR)
+            y_frame <- filter_significant_terms(str_res_list[[j]], category, enrichment_score_threshold, fdr_threshold) %>%
+                select(termID, termDescription, signed_log_FDR)
+            df_list[[my_count]] <- full_join(x_frame, y_frame, by = "termID", suffix = c(".x", ".y")) %>%
+                mutate(
+                    termDescription = coalesce(termDescription.x, termDescription.y),
+                    signed_log_FDR.x = replace_na(signed_log_FDR.x, 0),
+                    signed_log_FDR.y = replace_na(signed_log_FDR.y, 0)
+                ) %>%
+                select(termID, termDescription, signed_log_FDR.x, signed_log_FDR.y)
+            names(df_list)[my_count] <- paste0(names(str_res_list)[j], "_v_", names(str_res_list)[i])
+            my_count <- my_count + 1
+        }
+    }
+
+    df_list <- lapply(names(df_list), function(x) df_list[[x]] %>% mutate(comparison = x))
+
+    do.call(rbind, df_list) %>%
+        mutate(comparison = gsub("_v_", "\n vs ", comparison)) %>%
+        ggplot(aes(x = signed_log_FDR.x, y = signed_log_FDR.y, label = termDescription)) +
+        geom_point_interactive(aes(data_id = termID, tooltip = termDescription), size = 1.5, hover_nearest = TRUE) +
+        facet_wrap(vars(comparison), ncol = 2)
+}
+
+girafe_linked_scatter <- function(p, height_svg = 10) {
+    girafe(ggobj = p, width_svg = 8, height_svg = height_svg) %>%
+        girafe_options(
+            opts_selection(type = "multiple", css = "fill:#D55E00;stroke:#D55E00;r:5pt;"),
+            opts_hover(css = "fill:#D55E00;stroke:#D55E00;r:5pt;"),
+            opts_hover_inv(css = "opacity:0.25;"),
+            opts_tooltip(css = "background-color:white;color:black;padding:4px;border:1px solid black;border-radius:3px;"),
+            opts_zoom(max = 5)
+        )
+}
+
+build_top_terms_barplot <- function(df, category, enrichment_score_threshold, fdr_threshold, top_n = 5, redundancy_cut_height = 0.9) {
+    filtered <- filter_significant_terms(df, category, enrichment_score_threshold, fdr_threshold)
+
+    ## Reduced separately per direction so a low-FDR "decreased" term can't
+    ## evict a distinct "increased" representative from the same protein-
+    ## overlap cluster (and vice versa).
+    increased <- filtered %>% filter(direction == "top") %>%
+        reduce_string_results(cut_height = redundancy_cut_height) %>%
+        slice_max(signed_log_FDR, n = top_n, with_ties = FALSE)
+    decreased <- filtered %>% filter(direction == "bottom") %>%
+        reduce_string_results(cut_height = redundancy_cut_height) %>%
+        slice_min(signed_log_FDR, n = top_n, with_ties = FALSE)
+    top_terms <- bind_rows(increased, decreased)
+
+    if (nrow(top_terms) == 0) return(NULL)
+
+    top_terms <- top_terms %>%
+        mutate(termDescription = str_wrap(termDescription, width = 50)) %>%
+        mutate(termDescription = fct_reorder(termDescription, signed_log_FDR))
+
+    ggplot(top_terms, aes(x = signed_log_FDR, y = termDescription, fill = enrichmentScore)) +
+        geom_col() +
+        geom_vline(xintercept = 0, color = "grey40") +
+        scale_fill_gradient(low = "#cde2fb", high = "#0d366b") +
+        labs(x = "Signed -log10(FDR)", y = NULL, fill = "Enrichment\nscore")
+}
+```
+
+```{r run-or-load-cache, include = FALSE}
+if (file.exists(cache_file) && !isTRUE(params$force_refresh)) {
+
+    cached <- readRDS(cache_file)
+    job_map <- cached$job_map
+    page_frame <- cached$page_frame
+    str_res_list <- cached$str_res_list
+    failed_contrasts <- cached$failed_contrasts
+
+} else {
+
+    ## Submit
+    job_map <- list()
+    for (contrast in contrast_names) {
+        job_map[[contrast]] <- submit_contrast(input_files[[contrast]])
+        Sys.sleep(10)
+    }
+
+    ## Poll + download
+    page_frame <- data.frame(contrast = contrast_names, page = NA, status = NA)
+    str_res_list <- list()
+    failed_contrasts <- character(0)
+
+    for (i in seq_along(contrast_names)) {
+        contrast <- contrast_names[i]
+        result <- poll_job(job_map[[contrast]])
+        page_frame$status[i] <- result$status
+
+        if (result$status == "success") {
+            page_frame$page[i] <- result$page_url
+            str_res_list[[contrast]] <- read.delim(result$download_url)
+        } else {
+            failed_contrasts <- c(failed_contrasts, contrast)
+        }
+    }
+
+    saveRDS(
+        list(job_map = job_map, page_frame = page_frame, str_res_list = str_res_list, failed_contrasts = failed_contrasts),
+        file = cache_file
+    )
+}
+```
+
+```{r select-scatter-contrasts, include = FALSE}
+## Up to 4 contrasts are used for the pairwise scatter figures below
+available_contrasts <- names(str_res_list)
+contrast_selection_notes <- character(0)
+
+requested_chr <- if (length(params$selected_contrasts) == 1) as.character(params$selected_contrasts) else NA_character_
+unset <- is.na(requested_chr) || identical(trimws(requested_chr), "NA") || !nzchar(trimws(requested_chr))
+
+if (unset) {
+    scatter_contrasts <- head(available_contrasts, 4)
+} else {
+    requested <- trimws(strsplit(requested_chr, ",")[[1]])
+    requested <- requested[nzchar(requested)]
+
+    unknown <- setdiff(requested, available_contrasts)
+    if (length(unknown) > 0) {
+        contrast_selection_notes <- c(contrast_selection_notes, paste(
+            "Ignoring contrast(s) not found among successfully-processed contrasts:",
+            paste(unknown, collapse = ", ")
+        ))
+    }
+
+    valid <- intersect(requested, available_contrasts)
+
+    if (length(valid) > 4) {
+        contrast_selection_notes <- c(contrast_selection_notes, paste(
+            "selected_contrasts named more than 4 valid contrasts; using the first 4:",
+            paste(head(valid, 4), collapse = ", ")
+        ))
+        valid <- head(valid, 4)
+    }
+
+    if (length(valid) == 0) {
+        contrast_selection_notes <- c(contrast_selection_notes,
+            "No valid contrasts found in selected_contrasts; defaulting to the first 4 available contrasts.")
+        valid <- head(available_contrasts, 4)
+    }
+
+    scatter_contrasts <- valid
+}
+
+str_res_list_scatter <- str_res_list[scatter_contrasts]
+```
+
+# Summary
+
+```{r results = "asis"}
+if (length(failed_contrasts) > 0) {
+    cat(
+        '<div class="alert alert-warning">',
+        "<strong>Skipped contrasts:</strong> the following jobs failed or did not finish within the polling timeout ",
+        "and were excluded from the report below: ",
+        paste(failed_contrasts, collapse = ", "),
+        "</div>",
+        sep = ""
+    )
+}
+```
+
+```{r}
+page_frame %>%
+    filter(status == "success") %>%
+    select(contrast, page) %>%
+    knitr::kable(format = 'html',
+        caption =  "String report links for selected contrasts",
+        row.names = FALSE) %>%
+    kable_styling(bootstrap_options = 'striped', full_width = FALSE)
+
+write.csv(page_frame, file = file.path(tables_dir, "string_result_urls.csv"), row.names = FALSE)
+```
+
+```{r fig.cap = "GO BP overlap between comparisons"}
+affected_bp_list <- lapply(str_res_list, extract_significant_terms, category = "GO Process", fdr_threshold = 0.05)
+names(affected_bp_list) <- names(str_res_list)
+
+if (length(affected_bp_list) >= 2 && sum(lengths(affected_bp_list)) > 0) {
+    p <- upset(fromList(affected_bp_list), order.by = "freq", nsets = 10)
+
+    png(file = file.path(figures_dir, "Biological_Process_upset_plot.png"), width = 720, height = 480, pointsize = 6)
+    p
+    temp <- dev.off()
+
+    pdf(file = file.path(figures_dir, "Biological_Process_upset_plot.pdf"), width = 720, height = 480, pointsize = 6)
+    p
+    temp <- dev.off()
+
+    p
+} else {
+    cat("Fewer than two successful contrasts had significant GO Process terms; skipping the UpSet plot.\n")
+}
+```
+
+```{r category-scatter-config, include = FALSE}
+scatter_categories <- tribble(
+    ~category,       ~enrichment_score_threshold, ~fdr_threshold, ~redundancy_cut_height, ~label,
+    "GO Process",    1,                           0.1,            0.9,                    "Process",
+    "GO Component",  1,                           0.05,           0.9,                    "CC"
+)
+```
+
+```{r results = "asis"}
+cat(
+    '<div style="color: black; background-color: white;">',
+    "<strong>Contrasts used for pairwise comparison figures:</strong> ",
+    paste(names(str_res_list_scatter), collapse = ", "),
+    "</div>",
+    sep = ""
+)
+
+if (length(contrast_selection_notes) > 0) {
+    cat(
+        '<div style="color: black; background-color: white;">',
+        "<strong>selected_contrasts adjusted:</strong><ul>",
+        paste0("<li>", contrast_selection_notes, "</li>", collapse = ""),
+        "</ul></div>",
+        sep = ""
+    )
+}
+```
+
+```{r fig.cap = "GO Biological process comparisons", fig.height = 10}
+p <- build_pairwise_scatter(str_res_list_scatter, "GO Process",
+    scatter_categories$enrichment_score_threshold[scatter_categories$category == "GO Process"],
+    scatter_categories$fdr_threshold[scatter_categories$category == "GO Process"])
+
+girafe_linked_scatter(p)
+ggsave(p, file = file.path(figures_dir, "FDR_scatter_plot_Process.png"))
+ggsave(p, file = file.path(figures_dir, "FDR_scatter_plot_Process.pdf"))
+```
+
+```{r fig.cap = "GO Cellular category comparisons", fig.height = 10}
+p <- build_pairwise_scatter(str_res_list_scatter, "GO Component",
+    scatter_categories$enrichment_score_threshold[scatter_categories$category == "GO Component"],
+    scatter_categories$fdr_threshold[scatter_categories$category == "GO Component"])
+
+girafe_linked_scatter(p)
+ggsave(p, file = file.path(figures_dir, "FDR_scatter_plot_CC.png"))
+ggsave(p, file = file.path(figures_dir, "FDR_scatter_plot_CC.pdf"))
+```
+
+```{r results = "asis", fig.height = 5}
+for (contrast in names(str_res_list)) {
+    p <- build_top_terms_barplot(str_res_list[[contrast]], "GO Process",
+        scatter_categories$enrichment_score_threshold[scatter_categories$category == "GO Process"],
+        scatter_categories$fdr_threshold[scatter_categories$category == "GO Process"],
+        redundancy_cut_height = scatter_categories$redundancy_cut_height[scatter_categories$category == "GO Process"])
+
+    if (!is.null(p)) {
+        if (contrast %in% scatter_contrasts) {
+            cat("\n\n**Top 5 increased and decreased GO Biological Process terms:", contrast, "**\n\n")
+            print(p)
+        }
+        ggsave(p, file = file.path(figures_dir, paste0("Top_terms_barplot_Process_", contrast, ".png")), width = 4, height = 3)
+        ggsave(p, file = file.path(figures_dir, paste0("Top_terms_barplot_Process_", contrast, ".pdf")), width = 4, height = 3)
+    }
+}
+```
+
+```{r results = "asis", fig.height = 5}
+for (contrast in names(str_res_list)) {
+    p <- build_top_terms_barplot(str_res_list[[contrast]], "GO Component",
+        scatter_categories$enrichment_score_threshold[scatter_categories$category == "GO Component"],
+        scatter_categories$fdr_threshold[scatter_categories$category == "GO Component"],
+        redundancy_cut_height = scatter_categories$redundancy_cut_height[scatter_categories$category == "GO Component"])
+
+    if (!is.null(p)) {
+        if (contrast %in% scatter_contrasts) {
+            cat("\n\n**Top 5 increased and decreased GO Cellular Component terms:", contrast, "**\n\n")
+            print(p)
+        }
+        ggsave(p, file = file.path(figures_dir, paste0("Top_terms_barplot_CC_", contrast, ".png")), width = 4, height = 3)
+        ggsave(p, file = file.path(figures_dir, paste0("Top_terms_barplot_CC_", contrast, ".pdf")), width = 4, height = 3)
+    }
+}
+```
+
+<br><br><br><br>
+
+# Acknowledgment
+
+It is important to document use of each Biomedical Research Core Facility by investigators in publications. This facilitates efforts to obtain funding for our Cores and their continued functioning. Please recognize the core’s contribution in the Acknowledgment section of your publications.
+
+“We acknowledge support from the Bioinformatics Core of the University of Michigan Medical School’s Biomedical Research Core Facilities (RRID:SCR_019168).”
+
+If core staff have added scientific value to your project — made intellectual contributions in design, analysis and interpretation of data and/or manuscript writing, then please consider including them as co-authors in your publications.
